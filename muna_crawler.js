@@ -4,25 +4,20 @@
  * Muna magazine crawler
  *
  * Crawls https://gorkhapatraonline.com/publications/muna by slowly scrolling,
- * collecting article URLs that match:
- *   //a[contains(@href,'https://gorkhapatraonline.com/news/') and not(.//img)]
+ * opening each article, extracting title + full text content, and writing:
  *
- * Then opens each article URL, extracts title + full textual content,
- * and writes:
- *
- * 1) output/corpus.txt  -> full article texts
- * 2) output/titles.txt  -> one title per line (index)
+ * 1) corpus.txt  -> full article texts
+ * 2) titles.txt  -> one title per line (index)
  *
  * Usage:
  *   npm i playwright
  *   node muna_crawler.js
  *
  * Optional environment variables:
- *   START_URL=https://gorkhapatraonline.com/publications/muna
- *   MAX_SCROLL_ROUNDS=200
- *   MAX_IDLE_ROUNDS=12
- *   SCROLL_WAIT_MS=1800
- *   ARTICLE_WAIT_MS=1500
+ *   START_URL=...            (default: Muna publication URL)
+ *   MAX_SCROLL_ROUNDS=40     (default: 40)
+ *   SCROLL_WAIT_MS=1800      (default: 1800)
+ *   ARTICLE_WAIT_MS=1500     (default: 1500)
  */
 
 const fs = require('fs');
@@ -30,8 +25,7 @@ const path = require('path');
 const { chromium } = require('playwright');
 
 const START_URL = process.env.START_URL || 'https://gorkhapatraonline.com/publications/muna';
-const MAX_SCROLL_ROUNDS = Number(process.env.MAX_SCROLL_ROUNDS || 200);
-const MAX_IDLE_ROUNDS = Number(process.env.MAX_IDLE_ROUNDS || 12);
+const MAX_SCROLL_ROUNDS = Number(process.env.MAX_SCROLL_ROUNDS || 40);
 const SCROLL_WAIT_MS = Number(process.env.SCROLL_WAIT_MS || 1800);
 const ARTICLE_WAIT_MS = Number(process.env.ARTICLE_WAIT_MS || 1500);
 
@@ -44,55 +38,71 @@ function sleep(ms) {
 }
 
 function normalizeWhitespace(text) {
-  return (text || '').replace(/\s+/g, ' ').trim();
+  return text.replace(/\s+/g, ' ').trim();
 }
 
-async function collectArticleLinksByScrolling(page) {
+function uniquePreserveOrder(items) {
+  const seen = new Set();
+  const out = [];
+  for (const item of items) {
+    if (!seen.has(item)) {
+      seen.add(item);
+      out.push(item);
+    }
+  }
+  return out;
+}
+
+async function collectArticleLinks(page) {
   await page.goto(START_URL, { waitUntil: 'domcontentloaded', timeout: 90_000 });
   await sleep(ARTICLE_WAIT_MS);
 
-  const linkSet = new Set();
-  let idleRounds = 0;
+  let previousCount = 0;
+  let stableRounds = 0;
 
   for (let round = 1; round <= MAX_SCROLL_ROUNDS; round += 1) {
-    const newLinks = await page.evaluate(() => {
-      const anchors = Array.from(document.querySelectorAll('a[href]'));
-      return anchors
-        .filter((a) => {
-          const href = a.href || '';
-          const matchesNews = href.includes('https://gorkhapatraonline.com/news/');
-          const hasImageChild = Boolean(a.querySelector('img'));
-          return matchesNews && !hasImageChild;
-        })
-        .map((a) => a.href);
-    });
-
-    const before = linkSet.size;
-    for (const link of newLinks) linkSet.add(link);
-    const after = linkSet.size;
-
-    if (after === before) {
-      idleRounds += 1;
-    } else {
-      idleRounds = 0;
-    }
-
-    console.log(`Scroll round ${round}: collected ${after} unique article links.`);
-
-    // Scroll down to trigger infinite load.
     await page.evaluate(() => {
-      window.scrollBy(0, Math.floor(window.innerHeight * 0.9));
+      window.scrollBy(0, Math.floor(window.innerHeight * 0.85));
     });
 
     await sleep(SCROLL_WAIT_MS);
 
-    if (idleRounds >= MAX_IDLE_ROUNDS) {
-      console.log(`No new links for ${MAX_IDLE_ROUNDS} rounds. Stopping scroll.`);
+    const currentCount = await page.evaluate(() => {
+      const anchors = Array.from(document.querySelectorAll('a[href]'));
+      return anchors
+        .map((a) => a.href)
+        .filter((href) => /gorkhapatraonline\.com\/.+/.test(href) && !href.includes('#')).length;
+    });
+
+    if (currentCount === previousCount) {
+      stableRounds += 1;
+    } else {
+      stableRounds = 0;
+      previousCount = currentCount;
+    }
+
+    // If no new links have appeared in several rounds, assume we've reached end.
+    if (stableRounds >= 4) {
       break;
     }
   }
 
-  return Array.from(linkSet);
+  const rawLinks = await page.evaluate(() => {
+    const anchors = Array.from(document.querySelectorAll('a[href]'));
+    return anchors
+      .map((a) => a.href)
+      .filter((href) => {
+        if (!href) return false;
+        if (!href.includes('gorkhapatraonline.com')) return false;
+        if (href.includes('/publications/muna')) return false;
+        if (href.includes('/tag/')) return false;
+        if (href.includes('/author/')) return false;
+        if (href.includes('/category/')) return false;
+        return true;
+      });
+  });
+
+  return uniquePreserveOrder(rawLinks);
 }
 
 async function extractArticle(page, url) {
@@ -101,8 +111,8 @@ async function extractArticle(page, url) {
 
   const data = await page.evaluate(() => {
     const titleEl =
-      document.querySelector('article h1') ||
       document.querySelector('h1') ||
+      document.querySelector('article h2') ||
       document.querySelector('meta[property="og:title"]');
 
     let title = '';
@@ -114,6 +124,7 @@ async function extractArticle(page, url) {
       }
     }
 
+    // Prefer textual nodes inside article/main containers.
     const articleRoot =
       document.querySelector('article') ||
       document.querySelector('main') ||
@@ -122,11 +133,10 @@ async function extractArticle(page, url) {
 
     const clone = articleRoot.cloneNode(true);
 
-    clone
-      .querySelectorAll(
-        'script, style, noscript, svg, img, figure, nav, header, footer, aside, form, button, iframe'
-      )
-      .forEach((node) => node.remove());
+    // Remove noisy nodes.
+    clone.querySelectorAll(
+      'script, style, noscript, svg, img, figure, nav, header, footer, aside, form, button, iframe'
+    ).forEach((node) => node.remove());
 
     const text = (clone.innerText || clone.textContent || '').trim();
 
@@ -136,9 +146,12 @@ async function extractArticle(page, url) {
     };
   });
 
+  const cleanedTitle = normalizeWhitespace(data.title || 'Untitled');
+  const cleanedText = normalizeWhitespace(data.text || '');
+
   return {
-    title: normalizeWhitespace(data.title || 'Untitled'),
-    text: normalizeWhitespace(data.text || ''),
+    title: cleanedTitle,
+    text: cleanedText,
     url,
   };
 }
@@ -155,25 +168,24 @@ async function main() {
 
   try {
     console.log(`Opening list page: ${START_URL}`);
-    const links = await collectArticleLinksByScrolling(listPage);
+    const links = await collectArticleLinks(listPage);
 
     if (!links.length) {
-      console.warn('No article links found. Try increasing MAX_SCROLL_ROUNDS/MAX_IDLE_ROUNDS.');
+      console.warn('No candidate links found. Consider increasing MAX_SCROLL_ROUNDS.');
       return;
     }
 
-    console.log(`Found ${links.length} article links to crawl.`);
+    console.log(`Found ${links.length} candidate links.`);
 
     let written = 0;
     for (let i = 0; i < links.length; i += 1) {
       const link = links[i];
-
       try {
         console.log(`[${i + 1}/${links.length}] Crawling: ${link}`);
         const article = await extractArticle(articlePage, link);
 
-        if (!article.text) {
-          console.log('  Skipped (empty text).');
+        if (!article.text || article.text.length < 100) {
+          console.log('  Skipped (content too short / likely non-article).');
           continue;
         }
 
